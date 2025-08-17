@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::fs::read_to_string;
 use dotenv::dotenv;
@@ -9,15 +10,6 @@ use teloxide::{ prelude::*, types::ChatId, RequestError, Bot };
 use tokio::time::{ sleep, Duration };
 
 const PING_INTERVAL: u64 = 60; // in seconds
-const HOST_FILE: &str = "hosts.txt";
-const HOST_LIST: [&str; 6] = [
-    "192.168.69.200",
-    "192.168.69.201",
-    "192.168.69.11",
-    "192.168.69.12",
-    "192.168.69.143",
-    "192.168.69.2",
-];
 
 // state to track the task and ChatId
 #[derive(Default)]
@@ -31,6 +23,15 @@ struct BotState {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::init();
     dotenv().ok();
+    let mut hosts_file = PathBuf::new();
+
+    // set path for hosts config file depending if on debug or release build
+    if cfg!(not(debug_assertions)) {
+        // get binary path
+        hosts_file.push("/etc/notification_bot/hosts.txt");
+    } else {
+        hosts_file.push("hosts.txt");
+    }
 
     let bot = Bot::from_env();
     // Shared state and ChatId for tasks
@@ -39,20 +40,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // load hosts.txt to a vector
     let mut hosts: Vec<String> = Vec::new();
-    for line in read_to_string(HOST_FILE).unwrap().lines() {
+    for line in read_to_string(hosts_file).unwrap().lines() {
         hosts.push(line.to_string());
     }
-    info!("HOSTS -> {:?}", hosts);
 
     // insert hosts to bot state
-    let _ = {
+    {
         let mut lock = state.lock().await;
         for host in hosts {
             lock.hosts.insert(host, true);
         }
 
         info!("HOSTS -> {:?}", lock.hosts);
-    };
+    }
 
     // Set up command handler
     let handler = Update::filter_message().endpoint(
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 for (k, _) in hosts {
                     let handle = tokio::spawn(async move {
-                        let output = Command::new("ping")
+                        let output = Command::new("/bin/ping")
                             .args(["-l", "1", "-c", "3", "-W", "0.5", k.as_str()])
                             .output().await;
                         match output {
@@ -111,20 +111,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if text.starts_with("/start") {
-                debug!("start");
                 let mut state_guard = state.lock().await;
                 if state_guard.task.is_some() {
                     bot.send_message(chat_id, "Task is already running!").await?;
                     return Ok::<(), RequestError>(()); // Explicit error type
                 }
-                debug!("start");
 
                 // store ChatId
                 state_guard.chat_id = Some(chat_id);
                 log::info!(
                     "Host monitoring task started. \nChat ID: {}\n Monitored hosts {:?}",
                     chat_id,
-                    HOST_LIST
+                    state_guard.hosts
                 );
 
                 // create a oneshot channel to signal task termination

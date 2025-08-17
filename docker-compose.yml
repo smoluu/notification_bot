@@ -1,0 +1,10 @@
+services:
+  app:
+    container_name: notification_bot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - RUST_LOG=debug
+      - TELOXIDE_TOKEN=CHANGE THIS TO YOUR TELOXIDE TOKEN
+    restart: always
