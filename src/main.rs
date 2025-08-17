@@ -27,7 +27,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // set path for hosts config file depending if on debug or release build
     if cfg!(not(debug_assertions)) {
-        // get binary path
         hosts_file.push("/etc/notification_bot/hosts.txt");
     } else {
         hosts_file.push("hosts.txt");
