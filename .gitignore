@@ -1,2 +1,4 @@
 /target
 .env
+docker-compose.yml
+hosts.txt
