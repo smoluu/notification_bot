@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{ Duration, Instant, SystemTime };
 use std::fs::read_to_string;
 use dotenv::dotenv;
 use log::info;
-use teloxide::dispatching::dialogue::{InMemStorage, Dialogue, InMemStorageError};
-use tokio::sync::{Mutex, oneshot};
+use teloxide::dispatching::dialogue::{ InMemStorage, Dialogue };
+use tokio::sync::{ Mutex, oneshot };
 use tokio::process::Command;
-use teloxide::{prelude::*, types::ChatId, RequestError, Bot};
-use tokio::time::{sleep, Duration};
-use serde::{Serialize, Deserialize};
+use teloxide::{ prelude::*, types::ChatId, RequestError, Bot };
+use tokio::time::{ sleep };
+use serde::{ Serialize, Deserialize };
 
 const PING_INTERVAL: u64 = 60;
 
@@ -36,6 +37,7 @@ enum DialogueState {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::init();
+
     dotenv().ok();
     let mut hosts_file = PathBuf::new();
 
@@ -47,10 +49,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bot = Bot::from_env();
     let bot_state = Arc::new(Mutex::new(BotState::default()));
-    let app_state = Arc::new(Mutex::new(AppState {
-        password: std::env::var("BOT_PASSWORD").unwrap_or("default_password".to_string()),
-        ..Default::default()
-    }));
+    let app_state = Arc::new(
+        Mutex::new(AppState {
+            password: std::env::var("BOT_PASSWORD").unwrap_or("default_password".to_string()),
+            ..Default::default()
+        })
+    );
     let bot_state_clone = Arc::clone(&bot_state);
     let app_state_clone = Arc::clone(&app_state);
 
@@ -77,8 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .dependencies(dptree::deps![bot_state_clone, app_state_clone, dialogue_storage])
         .default_handler(|_| async move { () })
         .build()
-        .dispatch()
-        .await;
+        .dispatch().await;
 
     Ok(())
 }
@@ -88,7 +91,7 @@ async fn dialogue_handler(
     msg: Message,
     dialogue: Dialogue<DialogueState, InMemStorage<DialogueState>>,
     bot_state: Arc<Mutex<BotState>>,
-    app_state: Arc<Mutex<AppState>>,
+    app_state: Arc<Mutex<AppState>>
 ) -> Result<(), RequestError> {
     let chat_id = msg.chat.id;
     let text = msg.text().unwrap_or("");
@@ -121,12 +124,14 @@ async fn dialogue_handler(
                     let app_state_guard = app_state.lock().await;
                     app_state_guard.hosts.clone()
                 };
+                // start timer for host scan
+                let scan_start = Instant::now();
+
                 for (ip, _) in hosts {
                     let handle = tokio::spawn(async move {
                         let output = Command::new("/bin/nmap")
-                            .args(["-T5", "-sT","--host-timeout", "5000", ip.as_str()])
-                            .output()
-                            .await;
+                            .args(["-T5", "-sT", "-Pn", "--host-timeout", "5000", ip.as_str()])
+                            .output().await;
                         match output {
                             Ok(output) => {
                                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -137,29 +142,49 @@ async fn dialogue_handler(
                                     (false, format!("Host {} failed: {}", ip, stderr))
                                 }
                             }
-                            Err(e) => (
-                                false,
-                                format!("PING FAILED TO HOST -> {}, error -> {}", ip, e),
-                            ),
+                            Err(e) =>
+                                (false, format!("PING FAILED TO HOST -> {}, error -> {}", ip, e)),
                         }
                     });
                     handles.push(handle);
                 }
-                let mut responses: Vec<(bool, String)> = Vec::new();
+
+                let mut responses: Vec<String> = Vec::new();
                 for handle in handles {
                     match handle.await {
-                        Ok(result) => responses.push(result),
+                        Ok(result) => {
+                            // remove empty lines from each result
+                            let result = result.1
+                                .lines()
+                                .filter(|line| !line.trim().is_empty())
+                                .collect::<Vec<&str>>()
+                                .join("\n");
+                            responses.push(result);
+                        }
                         Err(e) => info!("ERROR -> {}", e),
                     }
                 }
-                let combined_string = responses
+                let scan_time = scan_start.elapsed().as_secs_f64();
+
+                // combine results to one string and remove unneccesary text
+                let mut combined_string = responses
                     .iter()
-                    .map(|(_success, s)| format!("{}\n", s))
-                    .collect::<Vec<_>>()
-                    .join("");
+                    .map(|output| {
+                        // split output into lines, skip the first line, and join with newlines
+                        output.lines().skip(1).collect::<Vec<_>>().join("\n") + "\n\n" // add newlines to separate results
+                    })
+                    .collect::<String>();
                 info!("{}", combined_string);
+
+                combined_string += format!(
+                    "Nmap scan finnished in {scan_time:.2} seconds"
+                ).as_str();
+
                 bot.send_message(chat_id, &combined_string).await?;
-            } else if text.starts_with("/start") {
+            } else if
+                // /start command
+                text.starts_with("/start")
+            {
                 let mut bot_state_guard = bot_state.lock().await;
 
                 if bot_state_guard.task.is_some() {
@@ -219,9 +244,8 @@ async fn dialogue_handler(
 
                 bot.send_message(
                     chat_id,
-                    format!("Notification Bot started. Your chat ID is: {}", chat_id),
-                )
-                .await?;
+                    format!("Notification Bot started. Your chat ID is: {}", chat_id)
+                ).await?;
             } else if text.starts_with("/stop") {
                 let mut bot_state_guard = bot_state.lock().await;
                 if let Some(tx) = bot_state_guard.task.take() {
@@ -249,9 +273,8 @@ async fn dialogue_handler(
                 }
                 bot.send_message(
                     chat_id,
-                    "Password accepted! You can now use /start, /stop, or /status.",
-                )
-                .await?;
+                    "Password accepted! You can now use /start, /stop, or /status."
+                ).await?;
                 if let Err(e) = dialogue.update(DialogueState::Default).await {
                     info!("Dialogue update error: {}", e);
                 }
