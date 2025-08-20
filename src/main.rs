@@ -3,20 +3,34 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::fs::read_to_string;
 use dotenv::dotenv;
-use log::{ debug, info };
-use tokio::sync::{ Mutex, oneshot };
+use log::info;
+use teloxide::dispatching::dialogue::{InMemStorage, Dialogue, InMemStorageError};
+use tokio::sync::{Mutex, oneshot};
 use tokio::process::Command;
-use teloxide::{ prelude::*, types::ChatId, RequestError, Bot };
-use tokio::time::{ sleep, Duration };
+use teloxide::{prelude::*, types::ChatId, RequestError, Bot};
+use tokio::time::{sleep, Duration};
+use serde::{Serialize, Deserialize};
 
-const PING_INTERVAL: u64 = 60; // in seconds
+const PING_INTERVAL: u64 = 60;
 
-// state to track the task and ChatId
+#[derive(Default)]
+struct AppState {
+    allowed_chats: Vec<ChatId>,
+    hosts: HashMap<String, bool>,
+    password: String,
+}
+
 #[derive(Default)]
 struct BotState {
-    task: Option<oneshot::Sender<()>>, // to signal task termination
+    task: Option<oneshot::Sender<()>>,
     chat_id: Option<ChatId>,
-    hosts: HashMap<String, bool>, // hostname, isonline
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+enum DialogueState {
+    #[default]
+    Default,
+    WaitingForPassword,
 }
 
 #[tokio::main]
@@ -25,7 +39,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
     let mut hosts_file = PathBuf::new();
 
-    // set path for hosts config file depending if on debug or release build
     if cfg!(not(debug_assertions)) {
         hosts_file.push("/etc/notification_bot/hosts.txt");
     } else {
@@ -33,64 +46,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let bot = Bot::from_env();
-    // Shared state and ChatId for tasks
-    let state = Arc::new(Mutex::new(BotState::default()));
-    let state_clone = Arc::clone(&state);
+    let bot_state = Arc::new(Mutex::new(BotState::default()));
+    let app_state = Arc::new(Mutex::new(AppState {
+        password: std::env::var("BOT_PASSWORD").unwrap_or("default_password".to_string()),
+        ..Default::default()
+    }));
+    let bot_state_clone = Arc::clone(&bot_state);
+    let app_state_clone = Arc::clone(&app_state);
 
-    // load hosts.txt to a vector
+    let dialogue_storage = InMemStorage::<DialogueState>::new();
+
     let mut hosts: Vec<String> = Vec::new();
     for line in read_to_string(hosts_file).unwrap().lines() {
         hosts.push(line.to_string());
     }
 
-    // insert hosts to bot state
     {
-        let mut lock = state.lock().await;
+        let mut app_state_guard = app_state.lock().await;
         for host in hosts {
-            lock.hosts.insert(host, true);
+            app_state_guard.hosts.insert(host, true);
         }
-
-        info!("HOSTS -> {:?}", lock.hosts);
+        info!("HOSTS -> {:?}", app_state_guard.hosts);
     }
 
-    // Set up command handler
-    let handler = Update::filter_message().endpoint(
-        |bot: Bot, msg: Message, state: Arc<Mutex<BotState>>| async move {
-            let chat_id = msg.chat.id;
-            let text = msg.text().unwrap_or("");
+    let handler = Update::filter_message()
+        .enter_dialogue::<Message, InMemStorage<DialogueState>, DialogueState>()
+        .endpoint(dialogue_handler);
+
+    Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![bot_state_clone, app_state_clone, dialogue_storage])
+        .default_handler(|_| async move { () })
+        .build()
+        .dispatch()
+        .await;
+
+    Ok(())
+}
+
+async fn dialogue_handler(
+    bot: Bot,
+    msg: Message,
+    dialogue: Dialogue<DialogueState, InMemStorage<DialogueState>>,
+    bot_state: Arc<Mutex<BotState>>,
+    app_state: Arc<Mutex<AppState>>,
+) -> Result<(), RequestError> {
+    let chat_id = msg.chat.id;
+    let text = msg.text().unwrap_or("");
+    let state = match dialogue.get().await {
+        Ok(state) => state.unwrap_or(DialogueState::Default),
+        Err(e) => {
+            info!("Dialogue error: {}", e);
+            DialogueState::Default
+        }
+    };
+
+    match state {
+        DialogueState::Default => {
+            let allowed_chats = {
+                let app_state_guard = app_state.lock().await;
+                app_state_guard.allowed_chats.clone()
+            };
+
+            if !allowed_chats.contains(&chat_id) {
+                bot.send_message(chat_id, "Enter password").await?;
+                if let Err(e) = dialogue.update(DialogueState::WaitingForPassword).await {
+                    info!("Dialogue update error: {}", e);
+                }
+                return Ok(());
+            }
 
             if text.starts_with("/status") {
                 let mut handles = Vec::new();
                 let hosts = {
-                    let state_guard = state.lock().await;
-                    state_guard.hosts.clone()
+                    let app_state_guard = app_state.lock().await;
+                    app_state_guard.hosts.clone()
                 };
-                for (k, _) in hosts {
+                for (ip, _) in hosts {
                     let handle = tokio::spawn(async move {
-                        let output = Command::new("/bin/ping")
-                            .args(["-l", "1", "-c", "3", "-W", "0.5", k.as_str()])
-                            .output().await;
+                        let output = Command::new("/bin/nmap")
+                            .args(["-T5", "-sT","--host-timeout", "5000", ip.as_str()])
+                            .output()
+                            .await;
                         match output {
                             Ok(output) => {
-                                let stdout = String::from_utf8_lossy(&output.stdout);
-                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                                 if output.status.success() {
-                                    (output.status.success(), stdout.to_string())
+                                    (true, format!("Host {}: {}", ip, stdout))
                                 } else {
-                                    (output.status.success(), stderr.to_string())
+                                    let stderr = String::from_utf8_lossy(&output.stderr);
+                                    (false, format!("Host {} failed: {}", ip, stderr))
                                 }
                             }
-                            Err(e) => {
-                                log::error!("PING ERROR => {}", e);
-                                (
-                                    false,
-                                    format!(
-                                        "PING FAILED TO HOST -> {}, error ->  {}",
-                                        k.as_str(),
-                                        e
-                                    ),
-                                )
-                            }
+                            Err(e) => (
+                                false,
+                                format!("PING FAILED TO HOST -> {}, error -> {}", ip, e),
+                            ),
                         }
                     });
                     handles.push(handle);
@@ -102,91 +152,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => info!("ERROR -> {}", e),
                     }
                 }
-
                 let combined_string = responses
                     .iter()
-                    .fold(String::new(), |acc, (_, s)| acc + s + "\n");
+                    .map(|(_success, s)| format!("{}\n", s))
+                    .collect::<Vec<_>>()
+                    .join("");
+                info!("{}", combined_string);
                 bot.send_message(chat_id, &combined_string).await?;
-            }
+            } else if text.starts_with("/start") {
+                let mut bot_state_guard = bot_state.lock().await;
 
-            if text.starts_with("/start") {
-                let mut state_guard = state.lock().await;
-                if state_guard.task.is_some() {
+                if bot_state_guard.task.is_some() {
                     bot.send_message(chat_id, "Task is already running!").await?;
-                    return Ok::<(), RequestError>(()); // Explicit error type
+                    return Ok(());
                 }
 
-                // store ChatId
-                state_guard.chat_id = Some(chat_id);
-                log::info!(
-                    "Host monitoring task started. \nChat ID: {}\n Monitored hosts {:?}",
-                    chat_id,
-                    state_guard.hosts
-                );
+                bot_state_guard.chat_id = Some(chat_id);
+                info!("Host monitoring task started. \nChat ID: {}", chat_id);
 
-                // create a oneshot channel to signal task termination
                 let (tx, rx) = oneshot::channel();
-                state_guard.task = Some(tx);
-                drop(state_guard); // Release the lock
-
-                // clone bot for the task
+                bot_state_guard.task = Some(tx);
                 let bot_clone = bot.clone();
-                let state_clone = Arc::clone(&state);
+                let app_state_clone = Arc::clone(&app_state);
+                let bot_state_clone = Arc::clone(&bot_state);
 
-                // spawn the periodic task
                 tokio::spawn(async move {
-                    let mut rx = rx; // Move receiver into task
+                    let mut rx = rx;
                     loop {
                         tokio::select! {
                             _ = &mut rx => {
-                                log::info!("Task for Chat ID {} stopped", chat_id);
+                                info!("Task for Chat ID {} stopped", chat_id);
                                 break;
                             }
                             _ = sleep(Duration::from_secs(PING_INTERVAL)) => {
-
                                 let hosts = {
-                                    let state_guard = state.lock().await;
-                                    state_guard.hosts.clone()
+                                    let app_state_guard = app_state_clone.lock().await;
+                                    app_state_guard.hosts.clone()
                                 };
-                                for (adress, online) in hosts {
+                                for (address, online) in hosts {
                                     if online {
-                                        // ping -l preload 3 packets,-c ping count -W timeout 0.5 seconds 
-                                        let output = Command::new("ping").args(["-l", "1", "-c", "3", "-W", "0.5", adress.as_str()]).output().await;
+                                        let output = Command::new("ping")
+                                            .args(["-l", "1", "-c", "3", "-W", "0.5", address.as_str()])
+                                            .output()
+                                            .await;
                                         match output {
                                             Ok(output) => {
                                                 let stdout = String::from_utf8_lossy(&output.stdout);
-                                                //let stderr = String::from_utf8_lossy(&output.stderr);
                                                 if !output.status.success() {
-                                                    let mut state_guard = state_clone.lock().await;
-                                                    state_guard.hosts.insert(adress, false);
-                                                    let _ = send_message(&bot_clone, chat_id, &format!("HOST OFFLINE -> STDOUT {}", &stdout)).await;
-                                                };
+                                                    let mut app_state_guard = app_state_clone.lock().await;
+                                                    app_state_guard.hosts.insert(address, false);
+                                                    let _ = bot_clone
+                                                        .send_message(chat_id, &format!("HOST OFFLINE -> STDOUT {}", &stdout))
+                                                        .await;
+                                                }
                                             }
-                                            Err(e) => log::error!("PING ERROR => {}", e)
+                                            Err(e) => info!("PING ERROR => {}", e),
                                         }
                                     }
-                                    
                                 }
-                             
                             }
                         }
                     }
-                    // update state to clear task after termination
-                    let mut state_guard = state_clone.lock().await;
-                    state_guard.task = None;
+                    let mut bot_state_guard = bot_state_clone.lock().await;
+                    bot_state_guard.task = None;
                 });
 
                 bot.send_message(
                     chat_id,
-                    format!("Notification Bot started. Your chat ID is: {}", chat_id)
-                ).await?;
+                    format!("Notification Bot started. Your chat ID is: {}", chat_id),
+                )
+                .await?;
             } else if text.starts_with("/stop") {
-                let mut state_guard = state.lock().await;
-                if let Some(tx) = state_guard.task.take() {
-                    // Signal the task to stop
+                let mut bot_state_guard = bot_state.lock().await;
+                if let Some(tx) = bot_state_guard.task.take() {
                     if tx.send(()).is_ok() {
                         bot.send_message(chat_id, "Task stopped.").await?;
-                        log::info!("Task stopped for Chat ID: {}", chat_id);
+                        info!("Task stopped for Chat ID: {}", chat_id);
                     } else {
                         bot.send_message(chat_id, "Failed to stop task.").await?;
                     }
@@ -194,22 +235,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bot.send_message(chat_id, "No task is running.").await?;
                 }
             }
-
-            Ok::<(), RequestError>(()) // Explicit error type
         }
-    );
+        DialogueState::WaitingForPassword => {
+            let password = {
+                let app_state_guard = app_state.lock().await;
+                app_state_guard.password.clone()
+            };
 
-    // Start the dispatcher
-    Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![state_clone])
-        .build()
-        .dispatch().await;
+            if text == password {
+                {
+                    let mut app_state_guard = app_state.lock().await;
+                    app_state_guard.allowed_chats.push(chat_id);
+                }
+                bot.send_message(
+                    chat_id,
+                    "Password accepted! You can now use /start, /stop, or /status.",
+                )
+                .await?;
+                if let Err(e) = dialogue.update(DialogueState::Default).await {
+                    info!("Dialogue update error: {}", e);
+                }
+            } else {
+                bot.send_message(chat_id, "Incorrect password. Try again.").await?;
+            }
+        }
+    }
 
-    Ok(())
-}
-
-async fn send_message(bot: &Bot, chat_id: ChatId, message: &str) -> Result<(), RequestError> {
-    log::info!("Sending message to Chat ID: {}", chat_id);
-    bot.send_message(chat_id, message).await?;
     Ok(())
 }

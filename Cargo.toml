@@ -9,3 +9,4 @@ log = "0.4"
 pretty_env_logger = "0.5"
 tokio = { version =  "1.8", features = ["rt-multi-thread", "process", "macros"] }
 dotenv = "0.15.0"
+serde = "1.0.219"
