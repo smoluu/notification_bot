@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{ Duration, Instant, SystemTime };
+use std::time::{ Duration, Instant };
 use std::fs::read_to_string;
 use dotenv::dotenv;
 use log::info;
@@ -130,7 +130,7 @@ async fn dialogue_handler(
                 for (ip, _) in hosts {
                     let handle = tokio::spawn(async move {
                         let output = Command::new("/bin/nmap")
-                            .args(["-T5", "-sT", "-Pn", "--host-timeout", "5000", ip.as_str()])
+                            .args(["-T3", "-sT", "-Pn", "--host-timeout", "5", ip.as_str()])
                             .output().await;
                         match output {
                             Ok(output) => {

@@ -9,17 +9,17 @@ COPY ./Cargo.toml ./Cargo.lock ./
 # create a dummy source file to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
-RUN rm -rf src
+# remove temp binary and source file
+RUN rm -rf target/release/notification_bot src
 
 # copy source files
 COPY ./src ./src
-RUN ls -la src/ && cat src/main.rs
 
 # build with source files
 RUN cargo build --release
 
 # runtime stage
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
 
 # install runtime dependencies
 RUN apt-get update && apt-get install -y \
