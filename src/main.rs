@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{ HashMap, HashSet };
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{ Duration, Instant };
-use std::fs::read_to_string;
+use std::fs::{ read_to_string, OpenOptions };
 use dotenv::dotenv;
 use log::info;
 use teloxide::dispatching::dialogue::{ InMemStorage, Dialogue };
@@ -17,6 +18,7 @@ const PING_INTERVAL: u64 = 60;
 #[derive(Default)]
 struct AppState {
     allowed_chats: Vec<ChatId>,
+    hosts_path: PathBuf,
     hosts: HashMap<String, bool>,
     password: String,
 }
@@ -32,6 +34,8 @@ enum DialogueState {
     #[default]
     Default,
     WaitingForPassword,
+    WaitingForHostAdd,
+    WaitingForHostRemove,
 }
 
 #[tokio::main]
@@ -39,12 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::init();
 
     dotenv().ok();
-    let mut hosts_file = PathBuf::new();
+    let mut hosts_path = PathBuf::new();
 
     if cfg!(not(debug_assertions)) {
-        hosts_file.push("/etc/notification_bot/hosts.txt");
+        hosts_path.push("/etc/notification_bot/hosts.txt");
     } else {
-        hosts_file.push("hosts.txt");
+        hosts_path.push("hosts.txt");
     }
 
     let bot = Bot::from_env();
@@ -52,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_state = Arc::new(
         Mutex::new(AppState {
             password: std::env::var("BOT_PASSWORD").unwrap_or("default_password".to_string()),
+            hosts_path: hosts_path,
             ..Default::default()
         })
     );
@@ -60,18 +65,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dialogue_storage = InMemStorage::<DialogueState>::new();
 
-    let mut hosts: Vec<String> = Vec::new();
-    for line in read_to_string(hosts_file).unwrap().lines() {
-        hosts.push(line.to_string());
-    }
-
-    {
-        let mut app_state_guard = app_state.lock().await;
-        for host in hosts {
-            app_state_guard.hosts.insert(host, true);
-        }
-        info!("HOSTS -> {:?}", app_state_guard.hosts);
-    }
+    let mut app_state_guard = app_state.lock().await;
+    app_state_guard.hosts = read_to_string(app_state_guard.hosts_path.clone())
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|host| (host, true))
+        .collect();
+    info!("HOSTS -> {:?}", app_state_guard.hosts);
+    drop(app_state_guard);
 
     let handler = Update::filter_message()
         .enter_dialogue::<Message, InMemStorage<DialogueState>, DialogueState>()
@@ -130,7 +134,7 @@ async fn dialogue_handler(
                 for (ip, _) in hosts {
                     let handle = tokio::spawn(async move {
                         let output = Command::new("/bin/nmap")
-                            .args(["-T3", "-sT", "-Pn", "--host-timeout", "5", ip.as_str()])
+                            .args(["-T3", "-sT", "-Pn", "--host-timeout", "10", ip.as_str()])
                             .output().await;
                         match output {
                             Ok(output) => {
@@ -258,6 +262,50 @@ async fn dialogue_handler(
                 } else {
                     bot.send_message(chat_id, "No task is running.").await?;
                 }
+            } else if text.starts_with("/add") {
+                bot.send_message(chat_id, "Enter hostname you want to add.").await?;
+
+                if let Err(e) = dialogue.update(DialogueState::WaitingForHostAdd).await {
+                    info!("Dialogue update error: {}", e);
+                }
+                return Ok(());
+            } else if text.starts_with("/remove") {
+                let hosts = {
+                    let app_state_guard = app_state.lock().await;
+                    app_state_guard.hosts.clone()
+                };
+                let hosts_string = hosts
+                    .iter()
+                    .map(|(host, _)| format!("{}", host))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                bot.send_message(
+                    chat_id,
+                    format!("Enter hostname you want to remove.\n{}", hosts_string)
+                ).await?;
+                if let Err(e) = dialogue.update(DialogueState::WaitingForHostRemove).await {
+                    info!("Dialogue update error: {}", e);
+                }
+
+                return Ok(());
+            } else if text.starts_with("/hosts") {
+                let hosts = {
+                    let app_state_guard = app_state.lock().await;
+                    app_state_guard.hosts.clone()
+                };
+
+                let hosts_string = hosts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (host, _))| format!(" {}: {}", index + 1, host))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                bot.send_message(chat_id, format!("Hosts: \n {}", hosts_string)).await?;
+                            info!("Listed hosts \n{} ", hosts_string);
+
+
+                return Ok(());
             }
         }
         DialogueState::WaitingForPassword => {
@@ -273,13 +321,82 @@ async fn dialogue_handler(
                 }
                 bot.send_message(
                     chat_id,
-                    "Password accepted! You can now use /start, /stop, or /status."
+                    "Password accepted! You can now use /start, /stop, /status, /hosts, /add, /remove."
                 ).await?;
                 if let Err(e) = dialogue.update(DialogueState::Default).await {
                     info!("Dialogue update error: {}", e);
                 }
             } else {
                 bot.send_message(chat_id, "Incorrect password. Try again.").await?;
+            }
+        }
+
+        DialogueState::WaitingForHostAdd => {
+            let mut new_host = "\n".to_string();
+            new_host.push_str(text);
+
+            let mut app_state_guard = app_state.lock().await;
+            // add new host to hosts file
+            let mut paths_file = OpenOptions::new()
+                .append(true)
+                .open(app_state_guard.hosts_path.clone())
+                .expect("cannot open file");
+
+            paths_file.write(new_host.as_bytes()).expect("Write failed to hosts.txt");
+
+            // set app_sate.hosts with updated hosts file
+            app_state_guard.hosts = read_to_string(app_state_guard.hosts_path.clone())
+                .unwrap()
+                .lines()
+                .map(String::from)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .map(|host| (host, true))
+                .collect();
+            info!("New hosts for {} -> {:?}", chat_id, app_state_guard.hosts);
+
+            bot.send_message(chat_id, "New host added.").await?;
+            info!("Added {} from hosts", new_host);
+
+            if let Err(e) = dialogue.update(DialogueState::Default).await {
+                info!("Dialogue update error: {}", e);
+            }
+        }
+
+        DialogueState::WaitingForHostRemove => {
+            let host_remove = text;
+            let mut app_state_guard = app_state.lock().await;
+
+            // remove hosts from app_state.hosts
+            if app_state_guard.hosts.remove(host_remove).is_none() {
+                bot.send_message(chat_id, format!("Host '{}' not found.", host_remove)).await?;
+                if let Err(e) = dialogue.update(DialogueState::Default).await {
+                    info!("Dialogue update error: {}", e);
+                }
+                return Ok(());
+            }
+
+            // generate updated hosts file string
+            let hosts: Vec<&str> = app_state_guard.hosts
+                .keys()
+                .map(|host| host.as_str()) // Convert &String to &str
+                .collect();
+            let updated_hosts = hosts.join("\n");
+
+            // write new hosts file
+            let mut hosts_file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&app_state_guard.hosts_path)
+                .expect("Cant open file");
+            hosts_file
+                .write_all(updated_hosts.as_bytes())
+                .expect("Cant open hosts.txt for writing");
+            bot.send_message(chat_id, format!("Host '{}' removed.", host_remove)).await?;
+            info!("Removed {} from hosts", host_remove);
+
+            if let Err(e) = dialogue.update(DialogueState::Default).await {
+                info!("Dialogue update error: {}", e);
             }
         }
     }
