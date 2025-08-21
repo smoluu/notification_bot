@@ -10,6 +10,9 @@ A Rust-based Telegram bot for monitoring hosts using `nmap` and `ping` commands.
   - `/start`: Begins periodic host monitoring and notifications.
   - `/stop`: Stops the monitoring task.
   - `/status`: Runs an `nmap` scan on all hosts and returns filtered results.
+  - `/add`: Add hosts
+  - `/remove`: Remove hosts
+  - `/hosts`: Lists all hosts
 - **Configuration**: Uses environment variables and a `hosts.txt` file for easy setup.
 
 ## Prerequisites
@@ -75,4 +78,5 @@ A Rust-based Telegram bot for monitoring hosts using `nmap` and `ping` commands.
 - [x] Change status command to nmap instead of ping to see running services.
 - example: nmap -oG scan -Pn -T5 192.168.69.200 --host-timeout 5
 
-- [ ] Add functionality to add/remove hosts with /add /remove commands
+- [X] Add functionality to add/remove hosts with /add /remove commands
+- [ ] Add functionality to change configuration eg. nmap commands , PING_INTERVAL
