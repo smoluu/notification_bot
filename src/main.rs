@@ -1,19 +1,30 @@
 use std::collections::{ HashMap, HashSet };
+use std::fmt::format;
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::exit;
 use std::sync::Arc;
 use std::time::{ Duration, Instant };
 use std::fs::{ read_to_string, OpenOptions };
 use dotenv::dotenv;
-use log::info;
+use log::{ debug, error, info };
 use teloxide::dispatching::dialogue::{ InMemStorage, Dialogue };
+use tokio::fs;
 use tokio::sync::{ Mutex, oneshot };
 use tokio::process::Command;
 use teloxide::{ prelude::*, types::ChatId, RequestError, Bot };
 use tokio::time::{ sleep };
 use serde::{ Serialize, Deserialize };
 
-const PING_INTERVAL: u64 = 60;
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct BotConfig {
+    ping_interval: u64,
+}
+impl Default for BotConfig {
+    fn default() -> Self {
+        BotConfig { ping_interval: 60 }
+    }
+}
 
 #[derive(Default)]
 struct AppState {
@@ -22,11 +33,11 @@ struct AppState {
     hosts: HashMap<String, bool>,
     password: String,
 }
-
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct BotState {
     task: Option<oneshot::Sender<()>>,
     chat_id: Option<ChatId>,
+    config: BotConfig,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -60,6 +71,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         })
     );
+    // read and load config
+    let bot_config_path = "config.toml";
+    let result = match fs::read_to_string(&bot_config_path).await {
+        Ok(r) => r,
+        Err(_) => {
+            error!("Could not read bot configuration file");
+            exit(1);
+        }
+    };
+    match toml::from_str(&result) {
+        Ok(result) => {
+            let mut bot_state_guard = bot_state.lock().await;
+            bot_state_guard.config = result;
+        }
+        Err(e) => {
+            error!("Unable to load data from {} => {}", bot_config_path, e);
+            exit(1);
+        }
+    }
+    debug!("bot state, {:?}", bot_state);
+
     let bot_state_clone = Arc::clone(&bot_state);
     let app_state_clone = Arc::clone(&app_state);
 
@@ -201,6 +233,7 @@ async fn dialogue_handler(
 
                 let (tx, rx) = oneshot::channel();
                 bot_state_guard.task = Some(tx);
+                let bot_config = bot_state_guard.config.clone();
                 let bot_clone = bot.clone();
                 let app_state_clone = Arc::clone(&app_state);
                 let bot_state_clone = Arc::clone(&bot_state);
@@ -213,7 +246,7 @@ async fn dialogue_handler(
                                 info!("Task for Chat ID {} stopped", chat_id);
                                 break;
                             }
-                            _ = sleep(Duration::from_secs(PING_INTERVAL)) => {
+                            _ = sleep(Duration::from_secs(bot_config.ping_interval)) => {
                                 let hosts = {
                                     let app_state_guard = app_state_clone.lock().await;
                                     app_state_guard.hosts.clone()
@@ -302,8 +335,67 @@ async fn dialogue_handler(
                     .join("\n");
 
                 bot.send_message(chat_id, format!("Hosts: \n {}", hosts_string)).await?;
-                            info!("Listed hosts \n{} ", hosts_string);
+                info!("Listed hosts \n{} ", hosts_string);
 
+                return Ok(());
+            } else if text.starts_with("/config") {
+                let input = text.to_ascii_lowercase();
+                let args: Vec<&str> = input.split(" ").collect();
+                if args.len() > 1 {
+                    match args[1] {
+                        "edit" => {
+                            if let Some(_) = args.get(2..4) {
+                                let mut bot_state_guard = bot_state.lock().await;
+                                let field = args[2];
+                                let value = args[3];
+                                match field {
+                                    "ping_interval" => {
+                                        match value.parse::<u64>() {
+                                            Ok(value) => {
+                                                bot_state_guard.config.ping_interval = value;
+                                                bot.send_message(
+                                                    chat_id,
+                                                    format!("Ping interval changed to {}", value)
+                                                ).await?;
+                                            }
+                                            Err(e) => {
+                                                bot.send_message(
+                                                    chat_id,
+                                                    format!("Invalid value: {}", e)
+                                                ).await?;
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        bot.send_message(chat_id, "Invalid arguments").await?;
+                                    }
+                                }
+                                // write new config to file
+                                let toml_config = toml::to_string(&bot_state_guard.config).unwrap();
+                                fs::write("config.toml", toml_config).await.unwrap();
+
+                                debug!("edit_args: {:?}", args);
+                            } else {
+                                bot.send_message(chat_id, "Not enought arguments").await?;
+                            }
+                        }
+                        "list" => {
+                            let bot_config = {
+                                let bot_state_guard = bot_state.lock().await;
+                                bot_state_guard.config.clone()
+                            };
+                            bot.send_message(chat_id, format!("{:?}", bot_config)).await?;
+                        }
+                        _ => {
+                            bot.send_message(chat_id, "Invalid input").await?;
+                        }
+                    }
+                } else {
+                    bot.send_message(
+                        chat_id,
+                        "/config list     - Show current config \n /config edit <field> <value>     - Update config field"
+                    ).await?;
+                }
 
                 return Ok(());
             }

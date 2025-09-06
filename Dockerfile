@@ -8,9 +8,7 @@ COPY ./Cargo.toml ./Cargo.lock ./
 
 # create a dummy source file to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release
-# remove temp binary and source file
-RUN rm -rf target/release/notification_bot src
+RUN cargo build --release && rm -rf target/release/notification_bot src
 
 # copy source files
 COPY ./src ./src
