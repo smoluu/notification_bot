@@ -1,8 +1,7 @@
 use std::collections::{ HashMap, HashSet };
-use std::fmt::format;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::exit;
+use std::process::{ exit };
 use std::sync::Arc;
 use std::time::{ Duration, Instant };
 use std::fs::{ read_to_string, OpenOptions };
@@ -19,10 +18,21 @@ use serde::{ Serialize, Deserialize };
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct BotConfig {
     ping_interval: u64,
+    ping_args: Vec<String>,
 }
 impl Default for BotConfig {
     fn default() -> Self {
-        BotConfig { ping_interval: 60 }
+        BotConfig {
+            ping_interval: 60,
+            ping_args: vec![
+                "-l".to_string(),
+                "1".to_string(),
+                "-c".to_string(),
+                "3".to_string(),
+                "-W".to_string(),
+                "0.5".to_string()
+            ],
+        }
     }
 }
 
@@ -240,6 +250,10 @@ async fn dialogue_handler(
 
                 tokio::spawn(async move {
                     let mut rx = rx;
+                    let mut ping_args = {
+                        let bot_state_guard = bot_state_clone.lock().await;
+                        bot_state_guard.config.ping_args.clone()
+                    };
                     loop {
                         tokio::select! {
                             _ = &mut rx => {
@@ -253,8 +267,9 @@ async fn dialogue_handler(
                                 };
                                 for (address, online) in hosts {
                                     if online {
+                                        ping_args.push(address.to_string());
                                         let output = Command::new("ping")
-                                            .args(["-l", "1", "-c", "3", "-W", "0.5", address.as_str()])
+                                            .args(&ping_args)
                                             .output()
                                             .await;
                                         match output {
@@ -270,6 +285,7 @@ async fn dialogue_handler(
                                             }
                                             Err(e) => info!("PING ERROR => {}", e),
                                         }
+                                        ping_args.pop();
                                     }
                                 }
                             }
@@ -339,7 +355,7 @@ async fn dialogue_handler(
 
                 return Ok(());
             } else if text.starts_with("/config") {
-                let input = text.to_ascii_lowercase();
+                let input = text;
                 let args: Vec<&str> = input.split(" ").collect();
                 if args.len() > 1 {
                     match args[1] {
@@ -357,6 +373,14 @@ async fn dialogue_handler(
                                                     chat_id,
                                                     format!("Ping interval changed to {}", value)
                                                 ).await?;
+                                                // write new config to file
+                                                let toml_config = toml
+                                                    ::to_string(&bot_state_guard.config)
+                                                    .unwrap();
+                                                fs::write(
+                                                    "config.toml",
+                                                    toml_config
+                                                ).await.unwrap();
                                             }
                                             Err(e) => {
                                                 bot.send_message(
@@ -366,13 +390,63 @@ async fn dialogue_handler(
                                             }
                                         }
                                     }
+                                    "ping_args" => {
+                                        // parse arguments from message
+                                        let joined = args[3..].join(" ");
+                                        let value = joined.trim_matches('"');
+                                        let mut ping_args: Vec<String> = value
+                                            .split_whitespace()
+                                            .map(|s| s.to_string())
+                                            .collect();
+                                        
+                                        debug!("new ping args : {:?}", &ping_args);
+                                        // test ping args
+                                        ping_args.push("127.0.0.1".to_string());
+                                        let output = Command::new("ping")
+                                            .args(&ping_args)
+                                            .output().await;
+                                        match output {
+                                            Ok(output) => {
+                                                let exit_code = output.status.code().unwrap();
+                                                debug!("exit code : {:?}", &exit_code);
+                                                if exit_code == 0 {
+                                                    ping_args.pop();
+                                                    let ping_args_clone = ping_args.clone();
+                                                    bot_state_guard.config.ping_args = ping_args;
+                                                    // write new config to file
+                                                    let toml_config = toml
+                                                        ::to_string(&bot_state_guard.config)
+                                                        .unwrap();
+                                                    fs::write(
+                                                        "config.toml",
+                                                        toml_config
+                                                    ).await.unwrap();
+                                                    bot.send_message(
+                                                        chat_id,
+                                                        format!(
+                                                            "Ping arguments set : {:?}",
+                                                            &ping_args_clone
+                                                        )
+                                                    ).await?;
+                                                } else {
+                                                    bot.send_message(
+                                                        chat_id,
+                                                        format!(
+                                                            "Invalid arguments ->{:?}",
+                                                            String::from_utf8_lossy(
+                                                                &output.stderr
+                                                            ).trim_end_matches(&['\r', '\n'][..])
+                                                        )
+                                                    ).await?;
+                                                }
+                                            }
+                                            Err(e) => info!("PING ERROR => {}", e),
+                                        }
+                                    }
                                     _ => {
                                         bot.send_message(chat_id, "Invalid arguments").await?;
                                     }
                                 }
-                                // write new config to file
-                                let toml_config = toml::to_string(&bot_state_guard.config).unwrap();
-                                fs::write("config.toml", toml_config).await.unwrap();
 
                                 debug!("edit_args: {:?}", args);
                             } else {
